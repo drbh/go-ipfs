@@ -45,6 +45,7 @@ const (
 	hashOptionName        = "hash"
 	inlineOptionName      = "inline"
 	inlineLimitOptionName = "inline-limit"
+	reviveOptionName	  = "revive"
 )
 
 const adderOutChanSize = 8
@@ -129,6 +130,7 @@ You can now check what blocks have been created by:
 		cmds.StringOption(hashOptionName, "Hash function to use. Implies CIDv1 if not sha2-256. (experimental)").WithDefault("sha2-256"),
 		cmds.BoolOption(inlineOptionName, "Inline small blocks into CIDs. (experimental)"),
 		cmds.IntOption(inlineLimitOptionName, "Maximum block size to inline. (experimental)").WithDefault(32),
+		cmds.StringOption(reviveOptionName, "Iterate through known params to revive a CID from a file (experimental)"),
 	},
 	PreRun: func(req *cmds.Request, env cmds.Environment) error {
 		quiet, _ := req.Options[quietOptionName].(bool)
@@ -217,7 +219,112 @@ You can now check what blocks have been created by:
 		}
 
 		opts = append(opts, nil) // events option placeholder
+// / / / / / / / / / 
 
+
+// we want to check if there is a revive flag passed
+revival_target_cid, _ := req.Options[reviveOptionName].(string)
+if revival_target_cid != "" {
+
+    var added int
+    addit := toadd.Entries()
+    for addit.Next() {
+        _, dir := addit.Node().(files.Directory)
+        errCh := make(chan error, 1)
+        events := make(chan interface{}, adderOutChanSize)
+        opts[len(opts)-1] = options.Unixfs.Events(events)
+
+
+        default_opts := cmds.OptMap{
+            "inline-limit": 32,
+            "chunker": "size-262144",
+            "quiet": true,
+            // "pin": true,
+            "hash": "sha2-256",
+            "encoding": "json",
+        }
+        inlineLimit, _ := default_opts[inlineLimitOptionName].(int)
+        chunker, _ := default_opts[chunkerOptionName].(string)
+        hashFunStr, _ := default_opts[hashOptionName].(string)
+        hashFunCode, ok := mh.Names[strings.ToLower(hashFunStr)]				
+        if !ok {
+            return fmt.Errorf("unrecognized hash function: %s", strings.ToLower(hashFunStr))
+        }
+        my_opts := []options.UnixfsAddOption{
+            options.Unixfs.Hash(hashFunCode),
+            options.Unixfs.Inline(inline),
+            options.Unixfs.InlineLimit(inlineLimit),
+            options.Unixfs.Chunker(chunker),
+
+            options.Unixfs.Pin(dopin),
+            options.Unixfs.HashOnly(hash),
+            options.Unixfs.FsCache(fscache),
+            options.Unixfs.Nocopy(nocopy),
+
+            options.Unixfs.Progress(progress),
+            options.Unixfs.Silent(silent),
+
+            options.Unixfs.Events(events),
+        }
+        opts = my_opts
+
+        go func() {
+            var err error
+            defer close(events)
+            _, err = api.Unixfs().Add(req.Context, addit.Node(), opts...)
+            errCh <- err
+        }()
+
+        for event := range events {
+            output, ok := event.(*coreiface.AddEvent)
+            if !ok {
+                return errors.New("unknown event type")
+            }
+
+            h := ""
+            if output.Path != nil {
+                h = enc.Encode(output.Path.Cid())
+            }
+
+            if !dir && addit.Name() != "" {
+                output.Name = addit.Name()
+            } else {
+                output.Name = path.Join(addit.Name(), output.Name)
+            }
+
+            if err := res.Emit(&AddEvent{
+                Name:  output.Name,
+                Hash:  h,
+                Bytes: output.Bytes,
+                Size:  output.Size,
+            }); err != nil {
+                return err
+            }
+            if err := <-errCh; err != nil {
+                return err
+            }
+            
+            if h == revival_target_cid {
+                fmt.Println("success")
+            } else{
+                return fmt.Errorf("failed")
+            }
+
+            added++
+		}
+		if addit.Err() != nil {
+			return addit.Err()
+		}
+
+		if added == 0 {
+			return fmt.Errorf("expected a file argument")
+		}
+
+		return nil			
+    }
+}
+
+// / / / / / / / / /
 		var added int
 		addit := toadd.Entries()
 		for addit.Next() {
@@ -249,7 +356,6 @@ You can now check what blocks have been created by:
 				} else {
 					output.Name = path.Join(addit.Name(), output.Name)
 				}
-
 				if err := res.Emit(&AddEvent{
 					Name:  output.Name,
 					Hash:  h,
